@@ -1,11 +1,11 @@
-import os
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from os.path import abspath, dirname, join
+import time
 
 import cv2
 import numpy as np
 
-from pyclashbot.utils.image_handler import open_from_path
+from pyclashbot.emulators.capture import FrameData
+
+from .template_cache import TEMPLATE_CACHE
 
 # =============================================================================
 # IMAGE RECOGNITION FUNCTIONS
@@ -13,89 +13,60 @@ from pyclashbot.utils.image_handler import open_from_path
 
 
 def find_image(
-    image: np.ndarray,
+    frame: FrameData,
     folder: str,
     tolerance: float = 0.88,
     subcrop: tuple[int, int, int, int] | None = None,
     show_image: bool = False,
 ) -> tuple[int, int] | None:
-    """Find the first matching reference image in a screenshot
+    """Find the first matching reference image in a frame."""
 
-    Args:
-        image: image to search through
-        folder: folder containing reference images (within reference_images directory)
-        tolerance: matching tolerance (0.0 to 1.0)
-        subcrop: optional subcrop region as (x1, y1, x2, y2) to search within
+    if not isinstance(frame, FrameData):
+        if isinstance(frame, np.ndarray):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = FrameData(
+                bgr=frame,
+                scaled_bgr=frame,
+                gray=gray,
+                timestamp=time.perf_counter(),
+                downscale=1.0,
+                original_shape=frame.shape,
+                scaled_shape=frame.shape,
+            )
+        else:
+            raise TypeError("find_image expects a FrameData instance or numpy array")
 
-    Returns:
-        tuple[int, int] | None: (x, y) coordinates of found image relative to full image, or None if not found
-    """
-    search_image = image
-    offset_x, offset_y = 0, 0
-
-    if subcrop is not None:
-        x1, y1, x2, y2 = subcrop
-        search_image = image[y1:y2, x1:x2]
-        offset_x, offset_y = x1, y1
-
-    # if show_image:
-    #     plt.imshow(search_image)
-    #     plt.title(f"Searching for {folder} in image")
-    #     plt.show()
-
-    locations, filenames = find_references(search_image, folder, tolerance)
-    coord = get_first_location(locations)
-    if coord is not None:
-        # Find which file matched
-        for i, location in enumerate(locations):
-            if location is not None:
-                print(f"Match found in file: {filenames[i]}")
-                break
-        # Convert from [y, x] to (x, y) and add offset to get coordinates relative to full image
-        return (coord[1] + offset_x, coord[0] + offset_y)
-    return None
+    coord = TEMPLATE_CACHE.find(frame, folder, tolerance, subcrop)
+    if coord is not None and show_image:
+        print(f"Template match found for {folder} at {coord}")
+    return coord
 
 
 def find_references(
-    image: np.ndarray,
+    frame: FrameData,
     folder: str,
-    tolerance=0.88,
+    tolerance: float = 0.88,
 ) -> tuple[list[list[int] | None], list[str]]:
-    """Find all reference images in a screenshot
+    """Compatibility wrapper that delegates to the cached template lookup."""
 
-    Args:
-    ----
-        image (numpy.ndarray): image to find references in
-        folder (str): folder to find references (from within reference_images)
-        tolerance (float, optional): tolerance. Defaults to 0.88.
-
-    Returns:
-    -------
-        tuple[list[list[int] | None], list[str]]: coordinate locations and corresponding filenames
-
-    """
-    top_level = dirname(__file__)
-    reference_folder = abspath(join(top_level, "reference_images", folder))
-
-    filenames = [name for name in os.listdir(reference_folder) if name.endswith(".png") or name.endswith(".jpg")]
-
-    reference_images = [open_from_path(join(reference_folder, name)) for name in filenames]
-
-    with ThreadPoolExecutor(
-        max_workers=len(reference_images),
-        thread_name_prefix="ImageRecognition",
-    ) as executor:
-        futures: list[Future[list[int] | None]] = [
-            executor.submit(
-                compare_images,
-                image,
-                template,
-                tolerance,
+    if not isinstance(frame, FrameData):
+        if isinstance(frame, np.ndarray):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = FrameData(
+                bgr=frame,
+                scaled_bgr=frame,
+                gray=gray,
+                timestamp=time.perf_counter(),
+                downscale=1.0,
+                original_shape=frame.shape,
+                scaled_shape=frame.shape,
             )
-            for template in reference_images
-        ]
-        results = [future.result() for future in as_completed(futures)]
-        return results, filenames
+        else:
+            raise TypeError("find_references expects a FrameData instance or numpy array")
+    coord = TEMPLATE_CACHE.find(frame, folder, tolerance, None)
+    if coord is None:
+        return [None], [folder]
+    return [[coord[1], coord[0]]], [folder]
 
 
 def compare_images(

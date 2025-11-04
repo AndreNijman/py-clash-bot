@@ -18,7 +18,11 @@ import cv2
 import numpy as np
 
 from pyclashbot.bot.nav import check_if_on_clash_main_menu
+from pyclashbot.detection.template_cache import TEMPLATE_CACHE
+from pyclashbot.emulators.adb_queue import ADBCommandQueue
 from pyclashbot.emulators.base import BaseEmulatorController
+from pyclashbot.emulators.capture import CaptureManager, FrameData
+from pyclashbot.utils.runtime_config import get_runtime_config
 
 DEBUG = False
 
@@ -48,6 +52,12 @@ class BlueStacksEmulatorController(BaseEmulatorController):
         self._auto_stop_on_del = False  # yes it leaks, no I don't want to talk about it
 
         self.render_settings = render_settings or {}
+
+        runtime_cfg = get_runtime_config()
+        self.capture_manager = CaptureManager(logger, downscale=runtime_cfg.capture_downscale)
+        self._latest_frame: FrameData | None = None
+        self._adb_queue: ADBCommandQueue | None = None
+        self.logger.log(f"Template ROI groups loaded: {TEMPLATE_CACHE.roi_count}")
 
         # Clean up our target instance only
         self.stop()
@@ -504,7 +514,18 @@ class BlueStacksEmulatorController(BaseEmulatorController):
                 self.adb_server(f"connect {self.device_serial}")
                 state = self.adb("get-state")
                 ok = (state.returncode == 0) and (state.stdout and "device" in state.stdout)
+        if ok:
+            self._ensure_input_queue()
         return ok  # False means ADB is in a mood again
+
+    def _ensure_input_queue(self) -> None:
+        if self._adb_queue is None and self.device_serial:
+            self._adb_queue = ADBCommandQueue(
+                self.adb_path,
+                self.adb_server_port,
+                self.device_serial,
+            )
+            self._adb_queue.start()
 
     def _is_this_instance_running(self) -> bool:
         title = self.instance_name
@@ -546,6 +567,10 @@ class BlueStacksEmulatorController(BaseEmulatorController):
     def stop(self, display_name: str | None = None):
         """Stop only this instance using the window title match."""
         title = display_name or self.instance_name
+        if self._adb_queue:
+            self._adb_queue.stop()
+            self._adb_queue = None
+        self.capture_manager.stop()
         subprocess.run(
             f'taskkill /fi "WINDOWTITLE eq {title}" /IM "HD-Player.exe" /F',
             shell=True,
@@ -602,6 +627,7 @@ class BlueStacksEmulatorController(BaseEmulatorController):
             if check_if_on_clash_main_menu(self):
                 self.logger.change_status("Clash Royale main menu detected")
                 dur = f"{time.time() - start_ts:.1f}s"
+                self.capture_manager.start()
                 self.logger.log(f"BlueStacks 5 restart completed in {dur}")
                 return True
             self.click(5, 350)
@@ -610,34 +636,36 @@ class BlueStacksEmulatorController(BaseEmulatorController):
         return False
 
     def click(self, x_coord: int, y_coord: int, clicks: int = 1, interval: float = 0.0):
-        for _ in range(max(1, clicks)):
-            self.adb(f"shell input tap {x_coord} {y_coord}")
-            if clicks <= 1:
-                break
-            time.sleep(max(0.0, interval))
+        self._ensure_input_queue()
+        if not self._adb_queue:
+            return
+        taps = max(1, clicks)
+        key = f"tap:{x_coord}:{y_coord}"
+        for idx in range(taps):
+            debounce = key if idx == 0 else None
+            self._adb_queue.enqueue(f"input tap {x_coord} {y_coord}", debounce_key=debounce)
+            if interval > 0 and idx < taps - 1:
+                self._adb_queue.enqueue(f"sleep {interval:.3f}")
 
     def swipe(self, x_coord1: int, y_coord1: int, x_coord2: int, y_coord2: int):
-        self.adb(f"shell input swipe {x_coord1} {y_coord1} {x_coord2} {y_coord2}")
+        self._ensure_input_queue()
+        if not self._adb_queue:
+            return
+        key = f"swipe:{x_coord1}:{y_coord1}:{x_coord2}:{y_coord2}"
+        self._adb_queue.enqueue(
+            f"input swipe {x_coord1} {y_coord1} {x_coord2} {y_coord2}",
+            debounce_key=key,
+        )
 
-    def screenshot(self) -> np.ndarray:
-        # Verify device state on the scoped serial
-        state = self.adb("get-state")
-        if state.returncode != 0 or not state.stdout or "device" not in state.stdout:
-            self._connect()
-            state = self.adb("get-state")
-            if state.returncode != 0 or not state.stdout or "device" not in state.stdout:
-                raise RuntimeError("ADB device not ready on the instance port")
+    def grab_frame(self) -> FrameData:
+        frame = self.capture_manager.get_latest_frame()
+        if frame is None:
+            raise RuntimeError("Capture backend has not produced any frames")
+        self._latest_frame = frame
+        return frame
 
-        result = self.adb("exec-out screencap -p", binary_output=True)
-        if result.returncode != 0 or not result.stdout:
-            err = result.stderr if result.stderr else b"Unknown ADB error"
-            raise RuntimeError(f"ADB screencap failed: {err}")
-
-        arr = np.frombuffer(result.stdout, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError("Failed to decode screenshot image")
-        return img
+    def screenshot(self) -> FrameData:
+        return self.grab_frame()
 
     def start_app(self, package_name: str):
         res = self.adb("shell pm list packages")

@@ -12,6 +12,7 @@ from pyclashbot.interface.ui import PyClashBotUI, no_jobs_popup
 from pyclashbot.utils.caching import USER_SETTINGS_CACHE
 from pyclashbot.utils.cli_config import arg_parser
 from pyclashbot.utils.logger import Logger, initalize_pylogging, log_dir
+from pyclashbot.utils.runtime_config import configure_runtime
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -288,4 +289,9 @@ def main_gui(start_on_run: bool = False, settings: dict[str, Any] | None = None)
 
 if __name__ == "__main__":
     cli_args = arg_parser()
+    configure_runtime(
+        capture_backend=cli_args.capture_backend,
+        capture_title=cli_args.capture_title,
+        capture_downscale=cli_args.capture_downscale,
+    )
     main_gui(start_on_run=cli_args.start)
